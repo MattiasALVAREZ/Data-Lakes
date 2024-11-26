@@ -2,55 +2,58 @@ import io
 import pandas as pd
 import boto3
 from transformers import AutoTokenizer
+import tempfile
 
 
 def process_to_curated(bucket_staging, bucket_curated, input_file, output_file, model_name):
-    """
-    Processes data from the staging bucket, tokenizes sequences, and uploads the processed file to the curated bucket.
-
-    Steps:
-    1. Connect to LocalStack S3 using `boto3` and fetch the input file from the staging bucket.
-    2. Ensure the input file contains a `sequence` column.
-    3. Use a pre-trained tokenizer to tokenize the sequences in the `sequence` column. 
-       The right model's name is already passed as a default argument so you shouldn't worry about that.
-       In case you are curious, the tokenizer we are using is associted to META's ESM2 8M model, that was state of the art in protein sequence classification some time ago.
-       In case you are even more curious, you can try using tokenizers from other models such as ProtBert, but you will likely need to adapt the preprocessing to those tokenizers.
-    4. Drop the original sequence field, add a tokenized sequence field to the data
-    5. Save the processed data to a temporary file locally.
-    6. Upload the processed file to the curated bucket.
-
-    Parameters:
-    - bucket_staging (str): Name of the staging S3 bucket.
-    - bucket_curated (str): Name of the curated S3 bucket.
-    - input_file (str): Name of the file to process in the staging bucket.
-    - output_file (str): Name of the output file to store in the curated bucket.
-    - model_name (str): Name of the Hugging Face model for tokenization.
-    """
     # Step 1: Initialize S3 client
-    # HINT: Use boto3.client and specify the endpoint URL to connect to LocalStack.
+    s3 = boto3.client('s3', endpoint_url='http://localhost:4566')
 
     # Step 2: Download the input file from the staging bucket
-    # HINT: Use s3.get_object to download the file and load it into a Pandas DataFrame.
-    # Ensure the input file exists and contains a 'sequence' column.
+    print(f"Downloading {input_file} from bucket {bucket_staging}...")
+    response = s3.get_object(Bucket=bucket_staging, Key=input_file)
+    data = pd.read_csv(io.BytesIO(response['Body'].read()))
+
+    # Ensure the input file contains a 'sequence' column
+    if 'sequence' not in data.columns:
+        raise ValueError("Input file must contain a 'sequence' column.")
 
     # Step 3: Initialize the tokenizer
-    # HINT: Use AutoTokenizer.from_pretrained(model_name) to load a tokenizer for the specified model.
+    print(f"Loading tokenizer for model: {model_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Step 4: Tokenize the sequences
-    # HINT: Iterate over the 'sequence' column and use the tokenizer to process each sequence.
-    # Use truncation, padding, and max_length=1024 to prepare uniform tokenized sequences.
+    print("Tokenizing sequences...")
+    tokenized_sequences = []
+    for seq in data['sequence']:
+        tokenized = tokenizer(
+            seq,
+            truncation=True,
+            padding='max_length',
+            max_length=1024,
+            return_tensors="np"
+        )
+        tokenized_sequences.append(tokenized['input_ids'][0])
 
     # Step 5: Create a DataFrame for tokenized sequences
-    # HINT: Convert the tokenized outputs into a DataFrame. Name the columns as `token_0`, `token_1`, etc.
+    tokenized_df = pd.DataFrame(tokenized_sequences, columns=[f"token_{i}" for i in range(1024)])
 
     # Step 6: Merge the tokenized data with the metadata
-    # HINT: Exclude the 'sequence' column from the metadata and concatenate it with the tokenized data.
+    metadata = data.drop(columns=['sequence'])
+    processed_data = pd.concat([metadata, tokenized_df], axis=1)
 
     # Step 7: Save the processed data locally
-    # HINT: Save the final DataFrame to a temporary file using `to_csv`.
+    print("Saving processed data locally...")
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as tmp_file:
+        processed_file_path = tmp_file.name
+        processed_data.to_csv(processed_file_path, index=False)
 
     # Step 8: Upload the processed file to the curated bucket
-    # HINT: Use s3.upload_fileobj to upload the file from the local path to the S3 curated bucket.
+    print(f"Uploading processed file to bucket {bucket_curated} as {output_file}...")
+    with open(processed_file_path, 'rb') as f:
+        s3.upload_fileobj(f, bucket_curated, output_file)
+
+    print("Processing and upload completed successfully.")
 
 
 if __name__ == "__main__":
